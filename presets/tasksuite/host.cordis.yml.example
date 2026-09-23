@@ -1,0 +1,28 @@
+# dsh-tasksuite — example HOST composition fragment (cordis.yml)
+#
+# When you want the supervisor to run for *every* session in a DSH deployment
+# (not just one preset), add its plugin row to the host `cordis.yml` alongside
+# the existing registries. Because awr-goal-supervisor only consumes host
+# services (`shell`, `timer`) and publishes none, it can safely live in the host
+# plane — this is the deployment-grade placement. The awr-tools / awr-task-board
+# rows are better left to a preset that needs them.
+#
+# This file is illustrative; merge the relevant rows into your real cordis.yml.
+
+plugins:
+  # --- Outer scheduling loop, process-wide -------------------------------
+  - id: awr-goal-supervisor
+    name: /home/wdf-pai/kf/dsh-tasksuite/plugins/awr-goal-supervisor/index.js
+    config:
+      awrBin: awr
+      workdir: /home/wdf-pai/kf
+      projectArg: /home/wdf-pai/kf
+      stalenessMs: 120000
+      heartbeatMs: 30000
+      dryRun: false
+
+  # --- OS-layer watchdog reasoning (README): cron + systemd ------------------
+  # The supervisor detects fake-death and prints a STALE/FAKE-DEATH marker on
+  # stdout. A cron/systemd unit watches that marker and, on restart, launches a
+  # fresh root agent via dsh-headless which runs `awr recovery` + resume. That
+  # OS layer is NOT part of this plugin; it belongs in your deployment unit.

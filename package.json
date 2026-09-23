@@ -1,0 +1,18 @@
+{
+  "name": "dsh-tasksuite",
+  "version": "0.1.0",
+  "description": "Self-written DSH plugin suite for long-horizon, multi-cell programming tasks: AWR state layer + DSH execution layer + OpenViking memory + outer scheduling loop with fake-death recovery.",
+  "license": "MIT",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/shishenshashen/dsh-tasksuite.git"
+  },
+  "scripts": {
+    "verify:host": "node scripts/verify-host.js",
+    "check": "node --check plugins/awr-tools/index.js && node --check plugins/awr-goal-supervisor/index.js && node --check plugins/awr-task-board/index.js"
+  },
+  "peerDependencies": {
+    "@originoneai/agent-work-runtime": "0.5.x"
+  }
+}

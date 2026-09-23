@@ -1,0 +1,6 @@
+name: dsh-tasksuite
+description: >-
+  DeepSeek Harness long-horizon task suite: AWR state layer + DSH execution layer
+  + OpenViking memory + outer scheduling loop with fake-death (zombie) recovery.
+  Composes the self-written awr-goal-supervisor, awr-tools, and awr-task-board
+  plugins.

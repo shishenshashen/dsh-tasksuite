@@ -1,0 +1,54 @@
+# dsh-tasksuite preset — `agent.cordis.yml`
+#
+# A starting agent preset that composes the three self-written plugins:
+#   awr-goal-supervisor  (HOST outer scheduling loop + fake-death recovery)
+#   awr-tools            (HOST read-only AWR Tools)
+#   awr-task-board       (CLIENT GUI board; host half is a separate row)
+#
+# PLANE NOTE (see editing-cordis-compositions):
+# The plugins here PUBLISH no service and only CONSUME host services
+# (`shell`, `timer`, `tools`). So the rows sit loose in the preset — no isolate
+# realm is needed unless a preset owns a service. `awr-tasksuite/preset.yml`
+# carries the display metadata; this file is the actual composition.
+#
+# This is a TEMPLATE composition for the repository. To install it on a machine,
+# copy the preset directory into $DSH_HOME/.agent-presets/ and adjust the `config`
+# values (workdir/projectArg/awrBin) to the local AWR project.
+
+rows:
+  # --- Self-written: outer scheduling loop + fake-death recovery (HOST) ---
+  - id: awr-goal-supervisor
+    name: ./plugins/awr-goal-supervisor/index.js
+    config:
+      awrBin: awr
+      workdir: /home/wdf-pai/kf
+      projectArg: /home/wdf-pai/kf
+      stalenessMs: 120000
+      heartbeatMs: 30000
+      dryRun: false
+
+  # --- Self-written: read-only AWR tools (HOST) ---
+  - id: awr-tools
+    name: ./plugins/awr-tools/index.js
+    config:
+      awrBin: awr
+      workdir: /home/wdf-pai/kf
+      timeoutMs: 30000
+
+  # --- Self-written: task board host RPC (HOST) ---
+  - id: awr-task-board-host
+    name: ./plugins/awr-task-board/index.js
+    method: host
+    config:
+      awrBin: awr
+      workdir: /home/wdf-pai/kf
+      projectArg: /home/wdf-pai/kf
+
+  # --- Self-written: task board GUI (CLIENT) ---
+  - id: awr-task-board
+    name: ./plugins/awr-task-board/index.js
+    method: client
+    config:
+      slot: settings.section
+      section: awr-task-board
+      refreshMs: 30000
