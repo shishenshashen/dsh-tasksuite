@@ -66,6 +66,9 @@
  *                   sessions after a restart (default false; dryRun forces off).
  *   resumeWindowMs -> how recent a session's lastSeen must be to count as
  *                   "was active before reboot" (default 1h).
+ *   resumeScanMs -> how often to re-scan the ledger and pull up sessions that
+ *                   died while the process kept running (default 5min; the
+ *                   boot scan at +1.5s stays, so a restart alone still works).
  *   ledgerPath   -> where the durable session ledger lives (default under
  *                   workdir/.dsh-tasksuite/sessions-ledger.json).
  */
@@ -84,6 +87,7 @@ module.exports = function makeAwrGoalSupervisor(configure) {
       heartbeatMs: 30_000,
       resume: false,
       resumeWindowMs: 3_600_000,
+      resumeScanMs: 300_000,
       ledgerPath: '',
     },
     configure || {},
@@ -248,14 +252,19 @@ module.exports = function makeAwrGoalSupervisor(configure) {
           recoveredOnThisStart = true
         }
 
-        // REAL 拉起 (pull-up): after a reboot, actually resume sessions that
-        // were active before the restart and are no longer in the live set.
-        async function resumeStaleSessions() {
-          if (bootResumeDone) return
-          bootResumeDone = true
+        // REAL 拉起 (pull-up): actually resume sessions that were active before
+        // the restart and are no longer in the live set. Runs once shortly after
+        // boot AND periodically (resumeScanMs) so sessions that die while the
+        // process stays up (e.g. LLM retry exhaustion) also get pulled back.
+        async function resumeStaleSessions(opts) {
+          const isBoot = !opts || opts.boot !== false
+          if (isBoot) {
+            if (bootResumeDone) return
+            bootResumeDone = true
+          }
           await ledgerLoad()
           await log(
-            'auto-resume scan: resume=' + String(cfg.resume) +
+            'auto-resume scan' + (isBoot ? ' (boot)' : ' (periodic)') + ': resume=' + String(cfg.resume) +
               ' dryRun=' + String(cfg.dryRun) +
               ' ledgerPath=' + (ledgerPath || '(none)') +
               ' sessions=' + (ledger.sessions ? Object.keys(ledger.sessions).length : 0),
@@ -411,6 +420,16 @@ module.exports = function makeAwrGoalSupervisor(configure) {
         ctx.timeout(() => {
           resumeStaleSessions().catch((e) => log('auto-resume scan err: ' + e.message))
         }, 1500)
+
+        // Periodic re-scan: pull up sessions that died while the process kept
+        // running (e.g. LLM retry exhaustion, wedged turns) without waiting for
+        // a restart. Only runs when resume is enabled and not dryRunning.
+        if (cfg.resume && !cfg.dryRun) {
+          const scanTimer = ctx.interval(() => {
+            resumeStaleSessions({ boot: false }).catch((e) => log('periodic resume err: ' + e.message))
+          }, Math.max(cfg.resumeScanMs || 300_000, 10_000))
+          ctx.on('dispose', () => scanTimer && scanTimer())
+        }
 
         log(
           'armed. watchers: pre-step, turn-stopping, error, session-start, level=HEARTBEAT(' +

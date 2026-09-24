@@ -29,8 +29,9 @@
 1. **心跳**：每个 step 开始（`agent/pre-step`）和安全边界（`agent/turn-stopping`）刷新 `lastHeartbeat`，并把该会话写入**持久化台账**（`workdir/.dsh-tasksuite/sessions-ledger.json`，跨重启留存其 `lastSeen`）。
 2. **watchdog**：fiber 内 `timer.interval` 每 `heartbeatMs` 检查一次，若 `now - lastHeartbeat > stalenessMs`，判定假死，输出 FAKE-DEATH 标记并跑 `awr recovery check`。
 3. **跨重启真正拉起（闭环）**：进程死了由 OS 层（cron/systemd）在重启后拉起宿主。宿主首次遇到 `agent/session-start` 时执行 `reconcile()` + 自动恢复扫描 `resumeStaleSessions()`：读台账，凡「`lastSeen` 在 `resumeWindowMs` 内、当前不在 `ctx.agents.list()`（live registry）、且 `awr status` 显示仍有 continue/claimable/waiting/blocked 未完成 work」的会话，**真正调用 `ctx.agents.resume({ resumeSessionId })` 拉回来续跑**——不是只打标记，而是真正把遗留会话重新拉起（需 `session-persistence-jsonl` 已挂载，`dryRun:false` + `resume:true` 时生效）。
+4. **周期重扫（进程未重启也能拉）**：除启动后的一次扫描（+1.5s）外，`cfg.resumeScanMs`（默认 5min）还会**周期性地重新扫描台账**。这样「进程一直活着、但某个会话在运行中死掉」的场景——典型如 **LLM 重试次数耗尽**（`llm/retry` 撞上 `maxRetries` 后 `turn/end reason=error`）、或一个 turn 卡死后被外部杀掉——也会被自动拉起来续跑，**不必等宿主重启**。同一个会话 resume 成功后会随新会话的 `agent/session-start` / `pre-step` 刷新 `lastSeen` 并进入 live registry，下一次扫描自动跳过，不会重复拉起。
 
-> 边界说明：DSH 没有任何受支持的、能在进程内部杀死一个正在飞行的 turn 的机制，所以**真正杀掉卡死进程**这一刀属于 OS 层（systemd `TimeoutStopSec` 等）；supervisor 负责**检测 + 标记 + 进程重启后用 `agents.resume` 真正把遗留/卡死会话拉回来**，形成「进程内只能检测、跨重启真正拉起」的闭环。README 的「部署建议」给出 systemd unit 示例思路。`dryRun:true` 时只打日志、不真正调用 resume，便于先观察再翻转。
+> 边界说明：DSH 没有任何受支持的、能在进程内部杀死一个正在飞行的 turn 的机制，所以**真正杀掉卡死进程**这一刀属于 OS 层（systemd `TimeoutStopSec` 等）；supervisor 负责**检测 + 标记 + 进程重启后用 `agents.resume` 真正把遗留/卡死会话拉回来**，形成「进程内只能检测、跨重启真正拉起」的闭环；进程未重启时，周期重扫（`resumeScanMs`）也能拉起运行中终止的会话（如重试耗尽）。README 的「部署建议」给出 systemd unit 示例思路。`dryRun:true` 时只打日志、不真正调用 resume，便于先观察再翻转。
 
 ## mcp/ —— AWR-MCP bridge（可选增强）
 

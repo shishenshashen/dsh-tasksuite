@@ -36,6 +36,9 @@ function runTest(name, cfg, steps, opts) {
   const live = new Set(opts.live || [])
   let awrStatusOut = opts.awrStatusOut || ''
 
+  // collect mock timers so the test can clean them up and let node exit
+  const timers = { ints: [], tos: [] }
+
   // mock fs service
   const fsSv = {
     resolve(target) { return Promise.resolve({ targetKey: 'k:' + target, displayPath: target }) },
@@ -83,8 +86,11 @@ function runTest(name, cfg, steps, opts) {
       return undefined
     },
     on(evt, fn) { (events[evt] = events[evt] || []).push(fn) },
-    interval(fn) { const h = setInterval(fn, 10); return () => clearInterval(h) },
-    timeout(fn) { const h = setTimeout(fn, 30); return () => clearTimeout(h) },
+    // Deterministic mock timers: fire fast (10ms/30ms) regardless of the real
+    // ms argument, so tests do not wait for production intervals (5min scan,
+    // 1.5s boot timeout, 30s heartbeat).
+    interval(fn) { const h = setInterval(fn, 10); timers.ints.push(h); return () => clearInterval(h) },
+    timeout(fn) { const h = setTimeout(fn, 30); timers.tos.push(h); return () => clearTimeout(h) },
   }
   // injected host services
   ctxMock.shell = shellSv
@@ -120,6 +126,10 @@ function runTest(name, cfg, steps, opts) {
     logged,
     writes,
     events,
+    cleanup() {
+      for (const h of timers.ints) clearInterval(h)
+      for (const h of timers.tos) clearTimeout(h)
+    },
     get: () => ({ resumed, logged, writes }),
   }
 }
@@ -140,6 +150,7 @@ async function main() {
     })
     await t.drive()
     check(t.resumed.length === 0, 'no resume calls when dryRun=true (got ' + t.resumed.length + ')')
+    t.cleanup()
   }
 
   // Test 2: resume:true + dryRun:false + unfinished AWR + stale non-live session
@@ -152,6 +163,7 @@ async function main() {
     await t.drive()
     const hasResume = t.resumed.some((r) => r.resumeSessionId === 'S1')
     check(hasResume, 'agents.resume({resumeSessionId:"S1"}) called for stale session')
+    t.cleanup()
   }
 
   // Test 3: resume:true but NO unfinished AWR work → skip
@@ -163,6 +175,7 @@ async function main() {
     })
     await t.drive()
     check(t.resumed.length === 0, 'no resume when AWR has no unfinished work')
+    t.cleanup()
   }
 
   // Test 4: session still live → NOT resumed
@@ -174,6 +187,7 @@ async function main() {
     })
     await t.drive()
     check(t.resumed.length === 0, 'live session S1 not resumed')
+    t.cleanup()
   }
 
   // Test 5: stale detection — heartbeat age exceeds stalenessMs
@@ -185,6 +199,27 @@ async function main() {
     await t.drive()
     const flagged = t.logged.some((l) => l.includes('FAKE-DEATH'))
     check(flagged, 'FAKE-DEATH logged when no heartbeat for > stalenessMs')
+    t.cleanup()
+  }
+
+  // Test 6: periodic re-scan — a session that died while the process kept
+  // running (e.g. LLM retry exhaustion) is pulled up without a restart.
+  console.log('\n[6] periodic re-scan pulls up a session that died in-run')
+  {
+    // boot scan (during first wait-resume) sees an EMPTY ledger → no candidates.
+    // Then session-start records S1 into the ledger; S1 is not live anymore
+    // (like a terminated conversation). The periodic scan (mock interval fires
+    // every ~10ms, well inside the 80ms wait) must then resume S1.
+    const t = runTest('t6', { dryRun: false, resume: true, resumeWindowMs: 3600000, resumeScanMs: 10, workdir: '', ledgerPath: '' }, ['wait-resume', 'session-start', 'wait-resume'], {
+      awrStatusOut: 'Continue: 1 | Claimable: 0 | Waiting: 0 | Blocked: 0\n',
+      live: [],
+    })
+    await t.drive()
+    const hasResume = t.resumed.some((r) => r.resumeSessionId === 'S1')
+    check(hasResume, 'periodic scan resumed S1 after it was recorded then died')
+    const periodicLogged = t.logged.some((l) => l.includes('auto-resume scan (periodic)'))
+    check(periodicLogged, 'periodic scan actually ran (log line present)')
+    t.cleanup()
   }
 
   console.log('\n=== RESULTS: ' + pass + ' passed, ' + fail + ' failed ===')
