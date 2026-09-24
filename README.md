@@ -16,7 +16,7 @@
 
 | 插件 | 平台 | 角色 | 是否可省 |
 | --- | --- | --- | --- |
-| `awr-goal-supervisor` | Host | **外层调度环 + 心跳 + 假死(zombie)恢复**。监听 `agent/session-start` / `agent/pre-step` / `agent/turn-stopping` / `agent/error`，刷新心跳并在新会话启动时对 AWR 账本做 reconcile；内部 watchdog 检测心跳超时并打 FAKE-DEATH 标记。 | **核心，不可省** |
+| `awr-goal-supervisor` | Host | **外层调度环 + 心跳 + 假死(zombie)恢复 + 跨重启真正拉起(recovery-driver)**。监听 `agent/session-start` / `agent/pre-step` / `agent/turn-stopping` / `agent/error`：刷新心跳、维护**持久化会话台账**、在新会话启动时对 AWR 账本 reconcile；内部 watchdog 检测心跳超时并打 FAKE-DEATH 标记；宿主重启后对「上次活跃、当前不在 live registry、且 AWR 仍有未完成 work」的会话**真正调用 `ctx.agents.resume` 拉起来**（非只打标记）。 | **核心，不可省** |
 | `awr-tasksuite/awr-tools` | Host | 克制版只读 Tool 封装（`awr_status` / `awr_ready` / `awr_work_show` / `awr_session_show`），把 AWR CLI 暴露给模型。 | 可选 |
 | `awr-task-board` | Host + Client | GUI 任务看板（Client Slot + Host RPC `awr-status`）。 | 可选 |
 
@@ -26,11 +26,11 @@
 
 `awr-goal-supervisor` 的处理：
 
-1. **心跳**：每个 step 开始（`agent/pre-step`）和安全边界（`agent/turn-stopping`）刷新 `lastHeartbeat`。
+1. **心跳**：每个 step 开始（`agent/pre-step`）和安全边界（`agent/turn-stopping`）刷新 `lastHeartbeat`，并把该会话写入**持久化台账**（`workdir/.dsh-tasksuite/sessions-ledger.json`，跨重启留存其 `lastSeen`）。
 2. **watchdog**：fiber 内 `timer.interval` 每 `heartbeatMs` 检查一次，若 `now - lastHeartbeat > stalenessMs`，判定假死，输出 FAKE-DEATH 标记并跑 `awr recovery check`。
-3. **跨重启**：进程真的死了由 OS 层（cron/systemd）在重启后拉起一个 dsh-headless root agent；该 agent 会在 `agent/session-start` 触发 `reconcile()`，发现上次心跳陈旧 → 走 README 的 recovery 流（`awr recovery` + `awr session resume`）。
+3. **跨重启真正拉起（闭环）**：进程死了由 OS 层（cron/systemd）在重启后拉起宿主。宿主首次遇到 `agent/session-start` 时执行 `reconcile()` + 自动恢复扫描 `resumeStaleSessions()`：读台账，凡「`lastSeen` 在 `resumeWindowMs` 内、当前不在 `ctx.agents.list()`（live registry）、且 `awr status` 显示仍有 continue/claimable/waiting/blocked 未完成 work」的会话，**真正调用 `ctx.agents.resume({ resumeSessionId })` 拉回来续跑**——不是只打标记，而是真正把遗留会话重新拉起（需 `session-persistence-jsonl` 已挂载，`dryRun:false` + `resume:true` 时生效）。
 
-> 边界说明：DSH 没有任何受支持的、能在进程内部杀死一个正在飞行的 turn 的机制，所以**真正杀掉卡死进程**这一刀属于 OS 层（systemd `TimeoutStopSec` 等），supervisor 负责**检测 + 标记 + 重启后融入 reconcile**。README 的「部署建议」给出 systemd unit 示例思路。
+> 边界说明：DSH 没有任何受支持的、能在进程内部杀死一个正在飞行的 turn 的机制，所以**真正杀掉卡死进程**这一刀属于 OS 层（systemd `TimeoutStopSec` 等）；supervisor 负责**检测 + 标记 + 进程重启后用 `agents.resume` 真正把遗留/卡死会话拉回来**，形成「进程内只能检测、跨重启真正拉起」的闭环。README 的「部署建议」给出 systemd unit 示例思路。`dryRun:true` 时只打日志、不真正调用 resume，便于先观察再翻转。
 
 ## mcp/ —— AWR-MCP bridge（可选增强）
 
@@ -65,8 +65,8 @@ npm run check
 ## 结语
 
 - 同会话续跑：DSH 现成（dsh-goal + session）。
-- 跨重启自动拉起续跑：**本仓库 `awr-goal-supervisor` 补上**。
-- 假死恢复：**同上，supervisor 的 heartbeat + FAKE-DEATH 检测 + 重启 reconcile**。
+- 跨重启自动拉起续跑：**本仓库 `awr-goal-supervisor` 补上**（`agents.resume` 真正拉起遗留会话）。
+- 假死恢复：**同上，supervisor 的 heartbeat + FAKE-DEATH 检测 + 重启后真正拉起**。
 - 蜂窝并行：DSH 现成（`tool-subagent` / `-workflow` / `-ralph` + `schedule`）。
 - 任务分配/状态层：AWR（claim/排他/revision）。
 - 记忆层：OpenViking。

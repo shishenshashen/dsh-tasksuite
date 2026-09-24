@@ -15,15 +15,19 @@
  *
  * Design (docs/compat-research.md, docs/combined-solution.md)
  * -----------------------------------------------------------
- * - State lives OUTSIDE the process in the AWR ledger (work item status,
- *   session ownership). This plugin never stores durable business state; it
- *   only (a) writes HEARTBEAT + CHECKPOINT at safe DSH lifecycle boundaries,
- *   and (b) on session-start reconciles against AWR so the next boot knows
- *   what to resume.
- * - It is a supervisor, not a doer: it never carries a goal forward by itself.
- *   It makes sure (1) a fresh root agent KNOWS there is unfinished work and has
- *   the session/work handle to `awr session resume`, and (2) a zombie is
- *   DETECTED (stale heartbeat) and surfaced so recovery can act.
+ * - State lives OUTSIDE the process: unfinished-work truth is in the AWR
+ *   ledger (work item status, session ownership), and this plugin keeps only a
+ *   small durable SESSION LEDGER (file of { sessionId -> lastSeen }) that
+ *   survives process restarts so it knows which sessions were active before a
+ *   reboot. Both are leaf data; this plugin stores no live objects across
+ *   restart.
+ * - It is a supervisor / recovery-driver, not a doer: it never carries a goal
+ *   forward itself. On restart it (a) reconciles against AWR so the next boot
+ *   knows what to resume, and (b) because resume is available (dsh-session-
+ *   persistence-jsonl is mounted), it ACTUALLY calls ctx.agents.resume(...) on
+ *   sessions that were active before the reboot and are no longer live, closing
+ *   BOTH the "process died leaving unfinished work" gap and the "session never
+ *   came back" gap.
  *
  * Fake-death detection
  * --------------------
@@ -31,33 +35,43 @@
  * `agent/pre-step` (every step start) and `agent/turn-stopping` (every safe
  * boundary) refresh the heartbeat. A per-Fiber timer then checks staleness: if
  * `now - lastHeartbeat > stalenessMs`, the run is declared STALE. That is the
- * signal that a model turn is wedged or the loop stalled without any step. On
- * restart, `reconcile()` sees the stale checkpoint and reports "resume via
- * session X" instead of treating the run as healthy. True watchdog enforcement
- * (killing a wedged process) is deliberately left to the OS layer (cron/systemd
- * TimeoutStopSec) — see README — because DSH has no sanctioned way to kill an
- * in-flight turn from inside itself.
+ * signal that a model turn is wedged or the loop stalled without any step.
+ * On restart, reconcile() reads the ledger + calls resume. True watchdog
+ * ENFORCEMENT (killing a wedged in-flight turn) is deliberately left to the OS
+ * layer (cron/systemd TimeoutStopSec) — see README — because DSH has no
+ * sanctioned way to kill an in-flight turn from inside itself.
  *
  * Verified Host Event + Service contracts used (see docs/):
- *   agent/session-start (emit)   { agent, source }
+ *   agent/session-start (emit)   { agent: { id: SessionId }, source }
  *   agent/pre-step      (waterfall { agent, messages, turn, step, signal }, next)
  *   agent/turn-stopping (serial) { agent, turn, signal }
  *   agent/error         (emit)   { agent, turn, step, error }
  *   ctx.shell           resolve()/run() -> ShellRunResult
- *   ctx.timer           inject(['timer']), timeout()/interval()
+ *   ctx.timer           timeout()/interval()/debounce()
+ *   ctx.fs (optional)   resolve/readText/stat/writeText (session ledger)
+ *   ctx.agents (opt.)   list() -> Agent[]; resume({resumeSessionId}) -> AgentHandle
  *
- * All contributions attach to the current Fiber (ctx.on / ctx.on('dispose')) so
+ * All contributions attach to the current Fiber (ctx.on / disposers) so
  * stop/update/undefine removes everything.
  *
  * Configure (static composition): { awrBin, workdir, projectArg, dryRun,
- *   stalenessMs, heartbeatMs }
- *   workdir      -> cwd for the awr CLI (AWR project root).
+ *   stalenessMs, heartbeatMs, resume, resumeWindowMs, ledgerPath }
+ *   workdir      -> cwd for the awr CLI (AWR project root) and ledger default.
  *   projectArg   -> passed as awr --project; defaults to workdir.
- *   dryRun       -> log-only: never mutate AWR (no resume marks / checkpoint
- *                   writes). Still runs the heartbeat + staleness watcher.
+ *   dryRun       -> log-only: never mutates AWR and never actually resumes
+ *                   sessions (still detects staleness + maintains the ledger).
  *   stalenessMs  -> fake-death threshold since the last heartbeat (default 120s).
  *   heartbeatMs  -> watchdog poll interval (default 30s).
+ *   resume       -> master switch for the REAL auto-resume of stale-but-live
+ *                   sessions after a restart (default false; dryRun forces off).
+ *   resumeWindowMs -> how recent a session's lastSeen must be to count as
+ *                   "was active before reboot" (default 1h).
+ *   ledgerPath   -> where the durable session ledger lives (default under
+ *                   workdir/.dsh-tasksuite/sessions-ledger.json).
  */
+
+const path = require('path')
+const fs = require('fs')
 
 module.exports = function makeAwrGoalSupervisor(configure) {
   const cfg = Object.assign(
@@ -68,6 +82,9 @@ module.exports = function makeAwrGoalSupervisor(configure) {
       dryRun: false,
       stalenessMs: 120_000,
       heartbeatMs: 30_000,
+      resume: false,
+      resumeWindowMs: 3_600_000,
+      ledgerPath: '',
     },
     configure || {},
   )
@@ -81,12 +98,23 @@ module.exports = function makeAwrGoalSupervisor(configure) {
         const AWR = cfg.awrBin
         const WD = cfg.workdir || ''
         const PROJ = cfg.projectArg ? ['--project', cfg.projectArg] : []
+        const FS = ctx.get('fs')
+        const AGENTS = ctx.get('agents')
 
         // ---- supervisor state (leaf scalars only; no live objects) ----
         let lastHeartbeat = Date.now()
         let lastBound = null // { work?: string, session?: string, turn?: number }
         let staleFired = false
         let recoveredOnThisStart = false
+
+        // ---- durable SESSION LEDGER (survives restart) ----
+        const defaultLedgerPath = WD
+          ? path.join(WD, '.dsh-tasksuite', 'sessions-ledger.json')
+          : ''
+        const ledgerPath = cfg.ledgerPath || defaultLedgerPath
+        let ledger = null // { version, sessions: { [sid]: { lastSeen } } }
+        let ledgerDirty = false
+        let bootResumeDone = false
 
         function shq(a) {
           const s = String(a == null ? '' : a)
@@ -113,17 +141,96 @@ module.exports = function makeAwrGoalSupervisor(configure) {
           console.log('[awr-goal-supervisor] ' + msg)
         }
 
-        // ---- RECONCILE (on session-start): did we leave unfinished work? ----
+        // ------------------------------------------------------------------
+        // SESSION LEDGER — record every agent we observe so, after a restart,
+        // we know which sessions were active and can truly resume them.
+        // ------------------------------------------------------------------
+        function ledgerLoad() {
+          if (ledger !== null) return Promise.resolve(ledger)
+          if (!ledgerPath) {
+            ledger = { version: 1, sessions: {} }
+            return Promise.resolve(ledger)
+          }
+          if (FS) {
+            return FS.resolve(ledgerPath)
+              .then((target) =>
+                FS.stat(target).then((info) => {
+                  if (!info) return { version: 1, sessions: {} }
+                  return FS.readText(target).then((txt) => {
+                    try {
+                      const parsed = JSON.parse(txt)
+                      return (parsed && parsed.sessions)
+                        ? parsed
+                        : { version: 1, sessions: {} }
+                    } catch (_e) {
+                      return { version: 1, sessions: {} }
+                    }
+                  })
+                }),
+              )
+              .then((l) => { ledger = l; return l })
+              .catch(() => { ledger = { version: 1, sessions: {} }; return ledger })
+          }
+          // No fs service — best-effort via node fs in the host process.
+          try {
+            if (fs.existsSync(ledgerPath)) {
+              const txt = fs.readFileSync(ledgerPath, 'utf8')
+              const parsed = JSON.parse(txt)
+              ledger = (parsed && parsed.sessions) ? parsed : { version: 1, sessions: {} }
+            } else {
+              ledger = { version: 1, sessions: {} }
+            }
+          } catch (_e) {
+            ledger = { version: 1, sessions: {} }
+          }
+          return Promise.resolve(ledger)
+        }
+
+        function ledgerSave() {
+          if (!ledgerDirty || !ledgerPath) return
+          ledgerDirty = false
+          const text = JSON.stringify(ledger)
+          if (FS) {
+            FS.resolve(ledgerPath).then((target) =>
+              FS.writeText(target, text).catch((e) =>
+                console.log('[awr-goal-supervisor] ledger write failed (fs): ' + (e && e.message)),
+              ),
+            )
+            return
+          }
+          try {
+            fs.mkdirSync(path.dirname(ledgerPath), { recursive: true })
+            fs.writeFileSync(ledgerPath, text, 'utf8')
+          } catch (e) {
+            console.log('[awr-goal-supervisor] ledger write failed (node fs): ' + (e && e.message))
+          }
+        }
+
+        function recordSession(sid) {
+          if (!sid) return
+          ledgerLoad().then(() => {
+            if (!ledger.sessions[sid]) ledger.sessions[sid] = {}
+            ledger.sessions[sid].lastSeen = Date.now()
+            ledgerDirty = true
+          })
+        }
+
+        // ------------------------------------------------------------------
+        // RECONCILE + REAL AUTO-RESUME (on session-start): bring back sessions
+        // that were active before the reboot and are no longer live.
+        // ------------------------------------------------------------------
         async function reconcile(payload) {
           const source = payload && payload.source
+          const sid = payload && payload.agent && payload.agent.id
           await log(
-            'session-start (source=' +
+            'session-start (id=' + String(sid || '?') + ', source=' +
               (typeof source === 'string' ? source : '?') +
               ') — reconciling against AWR ledger',
           )
+          if (sid) recordSession(sid)
           const st = await awr(['status'])
           if (!st.ok || !st.res) {
-            await log('status lookup failed: ' + (st.error || st.res.stderr.text))
+            await log('status lookup failed: ' + (st.error || (st.res && st.res.stderr && st.res.stderr.text)))
             return
           }
           const text = (st.res.stdout.text || '').trim()
@@ -132,15 +239,85 @@ module.exports = function makeAwrGoalSupervisor(configure) {
 
           const staleMs = Date.now() - lastHeartbeat
           if (staleMs > cfg.stalenessMs) {
-            // A previous run left a stale heartbeat -> fake-death on last boot.
             await log(
               'STALE heartbeat detected at start (last heartbeat ' +
                 Math.round(staleMs / 1000) + 's ago): previous run may have died ' +
-                'or wedged. This is the auto-resume entry point — the agent ' +
-                'should recover unfinished AWR work (see README: recovery flow).',
+                'or wedged.',
             )
           }
           recoveredOnThisStart = true
+        }
+
+        // REAL 拉起 (pull-up): after a reboot, actually resume sessions that
+        // were active before the restart and are no longer in the live set.
+        async function resumeStaleSessions() {
+          if (bootResumeDone) return
+          bootResumeDone = true
+          await ledgerLoad()
+          await log(
+            'auto-resume scan: resume=' + String(cfg.resume) +
+              ' dryRun=' + String(cfg.dryRun) +
+              ' ledgerPath=' + (ledgerPath || '(none)') +
+              ' sessions=' + (ledger.sessions ? Object.keys(ledger.sessions).length : 0),
+          )
+          if (!cfg.resume || cfg.dryRun) {
+            if (cfg.dryRun && Object.keys(ledger.sessions || {}).length > 0) {
+              await log(
+                'dry-run: would auto-resume stale sessions, but dryRun is true — ' +
+                  'set resume:true and dryRun:false to actually pull them back up.',
+              )
+            }
+            return
+          }
+          // Safety gate: only pull sessions up when AWR still has unfinished
+          // work. Prevents mass-resuming idle web sessions that have nothing
+          // to continue.
+          const st = await awr(['status'])
+          const stText = st.ok && st.res ? (st.res.stdout.text || '') : ''
+          // Real awr status summary looks like:
+          //   "Continue: 2 | Claimable: 0 | Waiting: 0 | Blocked: 3"
+          // Count any of continue/claimable/waiting/blocked that is non-zero as
+          // unfinished work (case-insensitive; the CLI capitalizes the labels).
+          const hasUnfinished = /(continue|claimable|waiting|blocked)\s*:\s*[1-9]/i.test(stText)
+          if (!hasUnfinished) {
+            await log('auto-resume: AWR has no unfinished work — nothing to pull up (skip).')
+            return
+          }
+          if (!AGENTS) {
+            await log('ctx.agents unavailable — cannot auto-resume (skip).')
+            return
+          }
+          let live
+          try {
+            live = new Set((AGENTS.list() || []).map((a) => a && a.id))
+          } catch (e) {
+            await log('agents.list() failed: ' + (e && e.message))
+            return
+          }
+          const now = Date.now()
+          const candidates = Object.keys(ledger.sessions || {})
+            .filter((sid) => {
+              const rec = ledger.sessions[sid]
+              const lastSeen = rec && rec.lastSeen
+              if (!lastSeen) return false
+              const recent = now - lastSeen < cfg.resumeWindowMs
+              const notLive = !live.has(sid)
+              return recent && notLive
+            })
+          if (!candidates.length) {
+            await log('auto-resume: no stale-but-recent sessions to pull up.')
+            return
+          }
+          await log('auto-resume: pulling up ' + candidates.length + ' session(s): ' + candidates.join(', '))
+          for (const sid of candidates) {
+            try {
+              const handle = await AGENTS.resume({ resumeSessionId: sid })
+              const resumedId = handle && handle.agent ? handle.agent.id : sid
+              await log('RESUMED (pulled up) session ' + resumedId)
+            } catch (e) {
+              await log('auto-resume failed for ' + sid + ': ' + (e && e.message))
+            }
+          }
         }
 
         // ---- HEARTBEAT refresh at every step + safe boundary ----
@@ -154,19 +331,22 @@ module.exports = function makeAwrGoalSupervisor(configure) {
         // ---- CHECKPOINT on safe serial turn boundary (write path) ----
         async function checkpoint(payload) {
           const turn = payload && payload.turn
+          const sid = payload && payload.agent && payload.agent.id
+          if (sid) recordSession(sid)
           beat(turn, lastBound)
           if (cfg.dryRun) {
             await log('turn-stopping@' + turn + ': heartbeat refreshed (dry-run, no AWR write)')
             return
           }
-          // The actual AWR session checkpoint write is owned by the agent via
-          // the awr-tools write path; here we only confirm a safe boundary fired.
           await log('turn-stopping@' + turn + ': safe boundary, checkpointable')
         }
 
         // ---- WATCHDOG: detect fake-death while the process is alive ----
         function armWatchdog() {
           const disposer = ctx.interval(() => {
+            // Debounced ledger flush rides the same tick.
+            if (ledgerDirty) ledgerSave()
+
             const staleMs = Date.now() - lastHeartbeat
             if (staleMs > cfg.stalenessMs) {
               if (!staleFired) {
@@ -183,8 +363,6 @@ module.exports = function makeAwrGoalSupervisor(configure) {
                       : 'Recovery: external watchdog should terminate this run; on restart ' +
                         'reconcile() will mark it stale and resume via AWR session.'),
                 )
-                // Optional: attempt an AWR operational mark so the ledger shows
-                // the run needs recovery (no-op in dry-run, best-effort).
                 if (!cfg.dryRun) {
                   awr(['recovery', 'check']).then((r) => {
                     const t = r.ok && r.res ? r.res.stdout.text : ''
@@ -202,6 +380,8 @@ module.exports = function makeAwrGoalSupervisor(configure) {
         // ---- ERROR hook: a step/turn failed; still refresh heartbeat ----
         async function onError(payload) {
           const turn = payload && payload.turn
+          const sid = payload && payload.agent && payload.agent.id
+          if (sid) recordSession(sid)
           if (typeof turn === 'number') beat(turn, lastBound)
           await log(
             'agent/error@turn=' + turn + ' step=' + (payload && payload.step) +
@@ -212,6 +392,8 @@ module.exports = function makeAwrGoalSupervisor(configure) {
         // ---- PRE-STEP (waterfall): refresh heartbeat, then pass through ----
         function onPreStep(payload, next) {
           const turn = payload && payload.turn
+          const sid = payload && payload.agent && payload.agent.id
+          if (sid) recordSession(sid)
           if (typeof turn === 'number') beat(turn, lastBound)
           return next()
         }
@@ -222,14 +404,21 @@ module.exports = function makeAwrGoalSupervisor(configure) {
         ctx.on('agent/error', (payload) => onError(payload).catch((e) => log('hook err: ' + e.message)))
         ctx.on('agent/pre-step', onPreStep)
 
+        // Seed the ledger + run the real pull-up scan shortly after arm, once.
+        ledgerLoad().then(() => {
+          recordSession(null) // no-op guard; ensure ledger object exists
+        })
+        ctx.timeout(() => {
+          resumeStaleSessions().catch((e) => log('auto-resume scan err: ' + e.message))
+        }, 1500)
+
         log(
           'armed. watchers: pre-step, turn-stopping, error, session-start, level=HEARTBEAT(' +
             Math.round(cfg.heartbeatMs / 1000) + 's)/STALE(' + Math.round(cfg.stalenessMs / 1000) +
-            's)' + (cfg.dryRun ? ' [dry-run]' : ''),
+            's)' + (cfg.dryRun ? ' [dry-run]' : '') +
+            (cfg.resume ? ' [real-auto-resume]' : ''),
         )
 
-        // Bind a handle for the current session (available after publish).
-        // Best-effort: attach a stable work binding if one is provided at mount.
         const bind = {
           work: cfg.work || undefined,
           session: cfg.session || undefined,
