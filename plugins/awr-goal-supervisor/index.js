@@ -88,6 +88,14 @@ module.exports = function makeAwrGoalSupervisor(configure) {
       resume: false,
       resumeWindowMs: 3_600_000,
       resumeScanMs: 300_000,
+      // 跨会话假死阈值：live registry 里仍在、但 lastSeen 超过此值的会话
+      // 视为卡死（网络/上下文/LLM 重试挂起），周期重扫也会尝试拉起。
+      liveStaleMs: 600_000,
+      // error 事件即时拉起：agent/error 后不等待下一轮周期重扫，立即尝试
+      // 对出错会话做一次拉起判定（有未完成 work 且会话已不在 live 或已假死）。
+      resumeOnError: true,
+      // error 即时拉起的冷却窗口：避免连续的 error 风暴反复触发 resume。
+      errorResumeCooldownMs: 60_000,
       ledgerPath: '',
     },
     configure || {},
@@ -210,13 +218,49 @@ module.exports = function makeAwrGoalSupervisor(configure) {
           }
         }
 
-        function recordSession(sid) {
+        function recordSession(sid, workId) {
           if (!sid) return
           ledgerLoad().then(() => {
             if (!ledger.sessions[sid]) ledger.sessions[sid] = {}
             ledger.sessions[sid].lastSeen = Date.now()
+            if (workId) ledger.sessions[sid].workId = workId
             ledgerDirty = true
           })
+        }
+
+        // Best-effort: pull a work item id off the event payload if the runtime
+        // ever attaches one (payload.workId / payload.work / agent fields / the
+        // session header). Absent, we fall back to the workspace-level check.
+        function extractWorkId(payload) {
+          if (!payload || typeof payload !== 'object') return undefined
+          if (typeof payload.workId === 'string' && payload.workId) return payload.workId
+          if (typeof payload.work === 'string' && payload.work) return payload.work
+          const a = payload.agent
+          if (a && typeof a === 'object') {
+            if (typeof a.workId === 'string' && a.workId) return a.workId
+            if (typeof a.work === 'string' && a.work) return a.work
+            const h = a.session && a.session.header
+            if (h && typeof h === 'object') {
+              if (typeof h.workId === 'string' && h.workId) return h.workId
+              if (typeof h.work === 'string' && h.work) return h.work
+            }
+          }
+          return undefined
+        }
+
+        // Gap A: when we know which work a session carries, check it against
+        // AWR before pulling it up — a completed/cancelled work is terminal and
+        // must not be resumed. An AWR read failure is treated as unfinished
+        // (conservative: prefer pulling to dropping).
+        async function isWorkTerminal(workId) {
+          if (!workId) return false
+          const w = await awr(['work', 'show', workId])
+          if (!w.ok || !w.res) return false
+          const txt = (w.res.stdout.text || '')
+          const m = txt.match(/Status:\s*([A-Za-z_]+)/)
+          if (!m) return false
+          const s = m[1].toLowerCase()
+          return s === 'completed' || s === 'cancelled'
         }
 
         // ------------------------------------------------------------------
@@ -231,7 +275,7 @@ module.exports = function makeAwrGoalSupervisor(configure) {
               (typeof source === 'string' ? source : '?') +
               ') — reconciling against AWR ledger',
           )
-          if (sid) recordSession(sid)
+          if (sid) recordSession(sid, extractWorkId(payload))
           const st = await awr(['status'])
           if (!st.ok || !st.res) {
             await log('status lookup failed: ' + (st.error || (st.res && st.res.stderr && st.res.stderr.text)))
@@ -258,13 +302,14 @@ module.exports = function makeAwrGoalSupervisor(configure) {
         // process stays up (e.g. LLM retry exhaustion) also get pulled back.
         async function resumeStaleSessions(opts) {
           const isBoot = !opts || opts.boot !== false
+          const reason = opts && opts.reason
           if (isBoot) {
             if (bootResumeDone) return
             bootResumeDone = true
           }
           await ledgerLoad()
           await log(
-            'auto-resume scan' + (isBoot ? ' (boot)' : ' (periodic)') + ': resume=' + String(cfg.resume) +
+            'auto-resume scan' + (isBoot ? ' (boot)' : reason ? ' (' + reason + ')' : ' (periodic)') + ': resume=' + String(cfg.resume) +
               ' dryRun=' + String(cfg.dryRun) +
               ' ledgerPath=' + (ledgerPath || '(none)') +
               ' sessions=' + (ledger.sessions ? Object.keys(ledger.sessions).length : 0),
@@ -304,6 +349,9 @@ module.exports = function makeAwrGoalSupervisor(configure) {
             return
           }
           const now = Date.now()
+          // Gap B: a session still in the live registry but whose last heartbeat
+          // is older than liveStaleMs is FAKE-DEAD (wedged turn / hanging model
+          // call / stalled loop) and is also a pull-up candidate.
           const candidates = Object.keys(ledger.sessions || {})
             .filter((sid) => {
               const rec = ledger.sessions[sid]
@@ -311,7 +359,8 @@ module.exports = function makeAwrGoalSupervisor(configure) {
               if (!lastSeen) return false
               const recent = now - lastSeen < cfg.resumeWindowMs
               const notLive = !live.has(sid)
-              return recent && notLive
+              const fakeDead = live.has(sid) && (now - lastSeen > cfg.liveStaleMs)
+              return recent && (notLive || fakeDead)
             })
           if (!candidates.length) {
             await log('auto-resume: no stale-but-recent sessions to pull up.')
@@ -319,6 +368,15 @@ module.exports = function makeAwrGoalSupervisor(configure) {
           }
           await log('auto-resume: pulling up ' + candidates.length + ' session(s): ' + candidates.join(', '))
           for (const sid of candidates) {
+            const rec = ledger.sessions[sid] || {}
+            // Gap A: skip sessions whose bound work is already terminal.
+            if (rec.workId) {
+              const terminal = await isWorkTerminal(rec.workId)
+              if (terminal) {
+                await log('auto-resume: skip ' + sid + ' — work ' + rec.workId + ' is completed/cancelled (terminal)')
+                continue
+              }
+            }
             try {
               const handle = await AGENTS.resume({ resumeSessionId: sid })
               const resumedId = handle && handle.agent ? handle.agent.id : sid
@@ -341,7 +399,7 @@ module.exports = function makeAwrGoalSupervisor(configure) {
         async function checkpoint(payload) {
           const turn = payload && payload.turn
           const sid = payload && payload.agent && payload.agent.id
-          if (sid) recordSession(sid)
+          if (sid) recordSession(sid, extractWorkId(payload))
           beat(turn, lastBound)
           if (cfg.dryRun) {
             await log('turn-stopping@' + turn + ': heartbeat refreshed (dry-run, no AWR write)')
@@ -386,23 +444,36 @@ module.exports = function makeAwrGoalSupervisor(configure) {
           ctx.on('dispose', () => disposer && disposer())
         }
 
-        // ---- ERROR hook: a step/turn failed; still refresh heartbeat ----
+        // ---- ERROR hook: a step/turn failed; refresh heartbeat and, when the
+        // session is gone from the live registry or wedged (fake-dead), trigger
+        // an IMMEDIATE pull-up instead of waiting for the next periodic scan.
+        let lastErrorResume = 0
         async function onError(payload) {
           const turn = payload && payload.turn
           const sid = payload && payload.agent && payload.agent.id
-          if (sid) recordSession(sid)
+          if (sid) recordSession(sid, extractWorkId(payload))
           if (typeof turn === 'number') beat(turn, lastBound)
           await log(
             'agent/error@turn=' + turn + ' step=' + (payload && payload.step) +
               (cfg.dryRun ? ' (dry-run)' : ' — ledger owner should record evidence'),
           )
+          // Gap C: on real errors, immediately attempt to pull the failed
+          // session back up (cooldown-guarded so a burst of errors does not
+          // hammer agents.resume). Unless dryRun.
+          if (cfg.resume && !cfg.dryRun && sid) {
+            const nowTs = Date.now()
+            if (nowTs - lastErrorResume > cfg.errorResumeCooldownMs) {
+              lastErrorResume = nowTs
+              await resumeStaleSessions({ boot: false, reason: 'error-triggered' })
+            }
+          }
         }
 
         // ---- PRE-STEP (waterfall): refresh heartbeat, then pass through ----
         function onPreStep(payload, next) {
           const turn = payload && payload.turn
           const sid = payload && payload.agent && payload.agent.id
-          if (sid) recordSession(sid)
+          if (sid) recordSession(sid, extractWorkId(payload))
           if (typeof turn === 'number') beat(turn, lastBound)
           return next()
         }

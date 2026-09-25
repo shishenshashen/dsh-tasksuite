@@ -22,6 +22,14 @@ function runTest(name, cfg, steps, opts) {
   opts = opts || {}
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'awr-sup-test-'))
   const ledgerFile = path.join(tmp, 'ledger.json')
+  // Pre-seed the ledger so tests can bind a session to a workId up front
+  // (Gap A) or backdate lastSeen to simulate fake-death (Gap B).
+  if (opts.ledgerSeed) {
+    fs.writeFileSync(ledgerFile, JSON.stringify(opts.ledgerSeed), 'utf8')
+    // ledgerSeed requires the plugin to actually read the file: with an empty
+    // ledgerPath ledgerLoad() short-circuits to an in-memory empty ledger.
+    cfg = Object.assign({}, cfg, { ledgerPath: ledgerFile })
+  }
   const writes = []
   const resumed = []
   const logged = []
@@ -69,6 +77,10 @@ function runTest(name, cfg, steps, opts) {
     resolve({ command }) { return { command } }, // synchronous, matches ShellExecSpec contract
     run(spec) {
       const command = spec && spec.command || ''
+      if (command.includes('work') && command.includes('show')) {
+        const out = opts.workShowOut || 'Status: in_progress; ready: true\n'
+        return Promise.resolve({ exitCode: 0, stdout: { text: out }, stderr: { text: '' } })
+      }
       if (command.includes('status')) {
         return Promise.resolve({ exitCode: 0, stdout: { text: awrStatusOut }, stderr: { text: '' } })
       }
@@ -219,6 +231,71 @@ async function main() {
     check(hasResume, 'periodic scan resumed S1 after it was recorded then died')
     const periodicLogged = t.logged.some((l) => l.includes('auto-resume scan (periodic)'))
     check(periodicLogged, 'periodic scan actually ran (log line present)')
+    t.cleanup()
+  }
+
+  // Test 7 (Gap A): session bound to a workId whose AWR status is terminal
+  // (completed/cancelled) must NOT be resumed.
+  console.log('\n[7] workId bound to completed work → skip resume')
+  {
+    const t = runTest('t7', { dryRun: false, resume: true, resumeWindowMs: 3600000, workdir: '', ledgerPath: '' }, ['wait-resume'], {
+      awrStatusOut: 'Continue: 1 | Claimable: 0 | Waiting: 0 | Blocked: 0\n',
+      workShowOut: 'W1 — some done task\nStatus: completed; ready: false\n',
+      ledgerSeed: { version: 1, sessions: { S1: { lastSeen: Date.now(), workId: 'W1' } } },
+      live: [],
+    })
+    await t.drive()
+    check(t.resumed.length === 0, 'no resume when bound work is terminal')
+    const skipped = t.logged.some((l) => l.includes('is completed/cancelled (terminal)'))
+    check(skipped, 'skip logged with terminal-work reason')
+    t.cleanup()
+  }
+
+  // Test 8 (Gap A): session bound to a workId whose AWR status is in_progress
+  // (non-terminal) IS resumed.
+  console.log('\n[8] workId bound to in_progress work → resume')
+  {
+    const t = runTest('t8', { dryRun: false, resume: true, resumeWindowMs: 3600000, workdir: '', ledgerPath: '' }, ['wait-resume'], {
+      awrStatusOut: 'Continue: 1 | Claimable: 0 | Waiting: 0 | Blocked: 0\n',
+      workShowOut: 'W1 — an active task\nStatus: in_progress; ready: false\n',
+      ledgerSeed: { version: 1, sessions: { S1: { lastSeen: Date.now(), workId: 'W1' } } },
+      live: [],
+    })
+    await t.drive()
+    const hasResume = t.resumed.some((r) => r.resumeSessionId === 'S1')
+    check(hasResume, 'resume called for non-terminal bound work')
+    t.cleanup()
+  }
+
+  // Test 9 (Gap B): a session STILL in the live registry but with lastSeen
+  // older than liveStaleMs is fake-dead and must be pulled up.
+  console.log('\n[9] live but stale (fake-dead) session → resume')
+  {
+    const stale = Date.now() - 20 * 60 * 1000 // 20min ago: > liveStaleMs(10min), < resumeWindowMs(1h)
+    const t = runTest('t9', { dryRun: false, resume: true, resumeWindowMs: 3600000, liveStaleMs: 600000, workdir: '', ledgerPath: '' }, ['wait-resume'], {
+      awrStatusOut: 'Continue: 1 | Claimable: 0 | Waiting: 0 | Blocked: 0\n',
+      ledgerSeed: { version: 1, sessions: { S1: { lastSeen: stale } } },
+      live: ['S1'],
+    })
+    await t.drive()
+    const hasResume = t.resumed.some((r) => r.resumeSessionId === 'S1')
+    check(hasResume, 'live-but-fake-dead session S1 resumed')
+    t.cleanup()
+  }
+
+  // Test 10 (Gap C): an agent/error triggers an immediate resume attempt
+  // instead of waiting for the next periodic scan.
+  console.log('\n[10] error event triggers immediate resume')
+  {
+    const t = runTest('t10', { dryRun: false, resume: true, errorResumeCooldownMs: 60000, workdir: '', ledgerPath: '' }, ['error', 'wait-resume'], {
+      awrStatusOut: 'Continue: 1 | Claimable: 0 | Waiting: 0 | Blocked: 0\n',
+      live: [],
+    })
+    await t.drive()
+    const hasResume = t.resumed.some((r) => r.resumeSessionId === 'S1')
+    check(hasResume, 'resume called right after agent/error')
+    const errScan = t.logged.some((l) => l.includes('auto-resume scan (error-triggered)'))
+    check(errScan, 'error-triggered scan logged')
     t.cleanup()
   }
 
