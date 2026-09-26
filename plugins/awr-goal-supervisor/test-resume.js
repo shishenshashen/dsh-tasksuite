@@ -68,7 +68,20 @@ function runTest(name, cfg, steps, opts) {
     list() { return Array.from(live).map((id) => ({ id })) },
     resume(options) {
       resumed.push(options)
+      if (opts.resumeFail === 'already-owned') {
+        return Promise.reject(new Error('session "' + options.resumeSessionId + '" is already owned by an active write handle'))
+      }
       return Promise.resolve({ agent: { id: options.resumeSessionId }, dispose() { return Promise.resolve() } })
+    },
+  }
+
+  // mock agentPresets service — records preset mounts so tests can verify the
+  // supervisor re-attaches the session's own preset on pull-up.
+  const mountedPresets = []
+  const presetsSv = {
+    mount(agentCtx, id) {
+      mountedPresets.push(id || '(default)')
+      return Promise.resolve({ id: id || 'default' })
     },
   }
 
@@ -95,6 +108,7 @@ function runTest(name, cfg, steps, opts) {
     get(name) {
       if (name === 'fs') return fsSv
       if (name === 'agents') return agentsSv
+      if (name === 'agentPresets') return presetsSv
       return undefined
     },
     on(evt, fn) { (events[evt] = events[evt] || []).push(fn) },
@@ -137,6 +151,7 @@ function runTest(name, cfg, steps, opts) {
     resumed,
     logged,
     writes,
+    mountedPresets,
     events,
     cleanup() {
       for (const h of timers.ints) clearInterval(h)
@@ -296,6 +311,51 @@ async function main() {
     check(hasResume, 'resume called right after agent/error')
     const errScan = t.logged.some((l) => l.includes('auto-resume scan (error-triggered)'))
     check(errScan, 'error-triggered scan logged')
+    t.cleanup()
+  }
+
+  // Test 11: pull-up must re-attach the session's own agent preset so the
+  // resumed session keeps its full tool table (bash/fs/jobs/goal), mirroring
+  // the GUI resume path (api-session-controller composeAgent → presets.mount).
+  console.log('\n[11] resume carries preset setup that mounts the session preset')
+  {
+    const t = runTest('t11', { dryRun: false, resume: true, resumeWindowMs: 3600000, workdir: '', ledgerPath: '' }, ['wait-resume'], {
+      awrStatusOut: 'Continue: 1 | Claimable: 0 | Waiting: 0 | Blocked: 0\n',
+      ledgerSeed: { version: 1, sessions: { S1: { lastSeen: Date.now(), preset: 'soul' } } },
+      live: [],
+    })
+    await t.drive()
+    const call = t.resumed.find((r) => r.resumeSessionId === 'S1')
+    check(!!call, 'agents.resume called for stale session')
+    if (call && typeof call.setup === 'function') {
+      // Invoke the setup callback the plugin attached, exactly as agent-loop
+      // would with (agentCtx, agent), and verify the preset got mounted.
+      await call.setup({}, { id: 'S1' })
+      check(t.mountedPresets.includes('soul'), 'preset "soul" mounted via resume setup (got ' + JSON.stringify(t.mountedPresets) + ')')
+    } else {
+      check(false, 'resume options carried a setup callback (none found)')
+    }
+    const logOk = t.logged.some((l) => l.includes('preset mounted for S1: soul'))
+    check(logOk, 'preset-mounted log line present')
+    t.cleanup()
+  }
+
+  // Test 12: already-owned failures (the session is actually alive / its write
+  // handle is held) must back off that session so periodic scans stop
+  // hammering the same six sessions every 5 minutes.
+  console.log('\n[12] already-owned resume failure enters cooldown (no per-scan retry)')
+  {
+    const t = runTest('t12', { dryRun: false, resume: true, resumeWindowMs: 3600000, resumeScanMs: 10, resumeFailCooldownMs: 600000, workdir: '', ledgerPath: '' }, ['wait-resume', 'wait-resume'], {
+      awrStatusOut: 'Continue: 1 | Claimable: 0 | Waiting: 0 | Blocked: 0\n',
+      ledgerSeed: { version: 1, sessions: { S1: { lastSeen: Date.now() } } },
+      live: [],
+      resumeFail: 'already-owned',
+    })
+    await t.drive()
+    const attempts = t.resumed.filter((r) => r.resumeSessionId === 'S1').length
+    check(attempts === 1, 'only ONE resume attempt despite two scans (cooldown active; got ' + attempts + ')')
+    const cooled = t.logged.some((l) => l.includes('already owned by an active write handle (cooldown'))
+    check(cooled, 'already-owned cooldown log line present')
     t.cleanup()
   }
 

@@ -96,6 +96,12 @@ module.exports = function makeAwrGoalSupervisor(configure) {
       resumeOnError: true,
       // error 即时拉起的冷却窗口：避免连续的 error 风暴反复触发 resume。
       errorResumeCooldownMs: 60_000,
+      // resume 失败冷却：already-owned（会话其实还活着/写句柄被占用）时
+      // 冷却该会话，避免每轮周期重扫对同一批会话反复撞锁刷屏。
+      resumeFailCooldownMs: 600_000,
+      // preset 挂载：resume 时把会话原有的 agentPreset（默认配置值）挂回
+      // 新 agent scope，否则被拉起的会话只剩 host 层工具（丢 bash/fs 等）。
+      preset: '',
       ledgerPath: '',
     },
     configure || {},
@@ -112,6 +118,7 @@ module.exports = function makeAwrGoalSupervisor(configure) {
         const PROJ = cfg.projectArg ? ['--project', cfg.projectArg] : []
         const FS = ctx.get('fs')
         const AGENTS = ctx.get('agents')
+        const PRESETS = ctx.get('agentPresets')
 
         // ---- supervisor state (leaf scalars only; no live objects) ----
         let lastHeartbeat = Date.now()
@@ -218,12 +225,13 @@ module.exports = function makeAwrGoalSupervisor(configure) {
           }
         }
 
-        function recordSession(sid, workId) {
+        function recordSession(sid, workId, preset) {
           if (!sid) return
           ledgerLoad().then(() => {
             if (!ledger.sessions[sid]) ledger.sessions[sid] = {}
             ledger.sessions[sid].lastSeen = Date.now()
             if (workId) ledger.sessions[sid].workId = workId
+            if (preset) ledger.sessions[sid].preset = preset
             ledgerDirty = true
           })
         }
@@ -244,6 +252,21 @@ module.exports = function makeAwrGoalSupervisor(configure) {
               if (typeof h.workId === 'string' && h.workId) return h.workId
               if (typeof h.work === 'string' && h.work) return h.work
             }
+          }
+          return undefined
+        }
+
+        // Best-effort: pull the agent preset id off the event payload (the
+        // session header carries agentPreset for GUI-created sessions). Falls
+        // back to the configured default preset so a pulled-up session regains
+        // its full tool table (bash/fs/jobs/goal) instead of host-layer only.
+        function extractPreset(payload) {
+          if (cfg.preset) return cfg.preset
+          if (!payload || typeof payload !== 'object') return undefined
+          const a = payload.agent
+          if (a && typeof a === 'object') {
+            const h = a.session && a.session.header
+            if (h && typeof h === 'object' && typeof h.agentPreset === 'string' && h.agentPreset) return h.agentPreset
           }
           return undefined
         }
@@ -275,7 +298,7 @@ module.exports = function makeAwrGoalSupervisor(configure) {
               (typeof source === 'string' ? source : '?') +
               ') — reconciling against AWR ledger',
           )
-          if (sid) recordSession(sid, extractWorkId(payload))
+          if (sid) recordSession(sid, extractWorkId(payload), extractPreset(payload))
           const st = await awr(['status'])
           if (!st.ok || !st.res) {
             await log('status lookup failed: ' + (st.error || (st.res && st.res.stderr && st.res.stderr.text)))
@@ -360,7 +383,11 @@ module.exports = function makeAwrGoalSupervisor(configure) {
               const recent = now - lastSeen < cfg.resumeWindowMs
               const notLive = !live.has(sid)
               const fakeDead = live.has(sid) && (now - lastSeen > cfg.liveStaleMs)
-              return recent && (notLive || fakeDead)
+              // already-owned / resume-failure cooldown: after a failed pull-up
+              // the session may still be owned by an active write handle (it is
+              // actually alive), so back off instead of hammering it each scan.
+              const blocked = rec.resumeBlockedUntil && now < rec.resumeBlockedUntil
+              return recent && (notLive || fakeDead) && !blocked
             })
           if (!candidates.length) {
             await log('auto-resume: no stale-but-recent sessions to pull up.')
@@ -377,12 +404,39 @@ module.exports = function makeAwrGoalSupervisor(configure) {
                 continue
               }
             }
+            // Preset mount: the GUI resume path composes the session's own
+            // agentPreset via presets.mount in the agent setup; replicate that
+            // here so a pulled-up session keeps its full tool table instead of
+            // falling back to host-layer tools only (bash/read/edit/jobs lost).
+            const presetId = rec.preset || cfg.preset || undefined
+            const setup = async (agentCtx) => {
+              if (!PRESETS) return
+              try {
+                if (presetId) {
+                  await PRESETS.mount(agentCtx, presetId)
+                } else {
+                  await PRESETS.mount(agentCtx)
+                }
+                await log('preset mounted for ' + sid + ': ' + (presetId || '(default)'))
+              } catch (e) {
+                await log('preset mount failed for ' + sid + ': ' + (e && e.message))
+              }
+            }
             try {
-              const handle = await AGENTS.resume({ resumeSessionId: sid })
+              const handle = await AGENTS.resume({ resumeSessionId: sid, setup })
               const resumedId = handle && handle.agent ? handle.agent.id : sid
               await log('RESUMED (pulled up) session ' + resumedId)
             } catch (e) {
-              await log('auto-resume failed for ' + sid + ': ' + (e && e.message))
+              const msg = e && e.message ? String(e.message) : String(e)
+              if (/already owned by an active write handle/i.test(msg)) {
+                // The session is actually alive (its write handle is held):
+                // back off this session so periodic scans stop re-hammering it.
+                rec.resumeBlockedUntil = Date.now() + (cfg.resumeFailCooldownMs || 600_000)
+                ledgerDirty = true
+                await log('auto-resume skipped ' + sid + ' — session already owned by an active write handle (cooldown ' + Math.round((cfg.resumeFailCooldownMs || 600_000) / 1000) + 's)')
+              } else {
+                await log('auto-resume failed for ' + sid + ': ' + msg)
+              }
             }
           }
         }
@@ -399,7 +453,7 @@ module.exports = function makeAwrGoalSupervisor(configure) {
         async function checkpoint(payload) {
           const turn = payload && payload.turn
           const sid = payload && payload.agent && payload.agent.id
-          if (sid) recordSession(sid, extractWorkId(payload))
+          if (sid) recordSession(sid, extractWorkId(payload), extractPreset(payload))
           beat(turn, lastBound)
           if (cfg.dryRun) {
             await log('turn-stopping@' + turn + ': heartbeat refreshed (dry-run, no AWR write)')
@@ -451,7 +505,7 @@ module.exports = function makeAwrGoalSupervisor(configure) {
         async function onError(payload) {
           const turn = payload && payload.turn
           const sid = payload && payload.agent && payload.agent.id
-          if (sid) recordSession(sid, extractWorkId(payload))
+          if (sid) recordSession(sid, extractWorkId(payload), extractPreset(payload))
           if (typeof turn === 'number') beat(turn, lastBound)
           await log(
             'agent/error@turn=' + turn + ' step=' + (payload && payload.step) +
@@ -473,7 +527,7 @@ module.exports = function makeAwrGoalSupervisor(configure) {
         function onPreStep(payload, next) {
           const turn = payload && payload.turn
           const sid = payload && payload.agent && payload.agent.id
-          if (sid) recordSession(sid, extractWorkId(payload))
+          if (sid) recordSession(sid, extractWorkId(payload), extractPreset(payload))
           if (typeof turn === 'number') beat(turn, lastBound)
           return next()
         }
