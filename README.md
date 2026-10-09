@@ -42,6 +42,14 @@
 - `presets/tasksuite/preset.yml` + `presets/tasksuite/agent.cordis.yml`：把三个自研插件组合进一个 agent preset 的**模板**（含配置项、plane 说明）。
 - `presets/tasksuite/host.cordis.yml.example`：当你想让 supervisor **进程级全局**生效时，挂进 host `cordis.yml` 的示例。
 
+## scripts/ —— 运维小工具
+
+- `scripts/patch-settings-lan.py`：放开 DSH Web 设置面板的「仅限本机回环」限制，让
+  `--trusted-host` 白名单内的局域网来源也能读写设置（修复「加载提供商目录失败:
+  settings are unavailable in this browser」）。幂等，核心升级后重跑即可重打补丁。
+  用法见 `docs/patch-settings-lan.md`：
+  `sudo python3 scripts/patch-settings-lan.py [--status|--backup]`
+
 ## 本地验证
 
 ```bash
